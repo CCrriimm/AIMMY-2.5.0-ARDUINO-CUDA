@@ -60,15 +60,15 @@ jobs:
               issue_number: context.issue.number,
               body: `## ❌ Invalid File Types
 
-No valid \`.onnx\` or \`.cfg\` files found.
+              No valid \`.onnx\` or \`.cfg\` files found.
 
-**Files uploaded:** ${fileList}
+              **Files uploaded:** ${fileList}
 
-**Required:**
-- Models: \`.onnx\` files in \`models/\` folder
-- Configs: \`.cfg\` files in \`configs/\` folder
+              **Required:**
+              - Models: \`.onnx\` files in \`models/\` folder
+              - Configs: \`.cfg\` files in \`configs/\` folder
 
-This PR has been automatically closed.`
+              This PR has been automatically closed.`
             });
 
             await github.rest.pulls.update({

@@ -97,4 +97,4 @@ jobs:
           name: AntiGravity-${{ env.PLATFORM }}-${{ env.CONFIGURATION }}
           path: Aimmy2/bin/${{ env.PLATFORM }}/${{ env.CONFIGURATION }}/net8.0-windows/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
