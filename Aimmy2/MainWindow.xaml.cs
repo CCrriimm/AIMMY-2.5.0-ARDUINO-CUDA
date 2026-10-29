@@ -1,4 +1,4 @@
-using Aimmy2.Class;
+﻿using Aimmy2.Class;
 using Aimmy2.Controls;
 using Aimmy2.Other;
 using Aimmy2.Theme;
@@ -1348,6 +1348,8 @@ namespace Aimmy2
                 if (uiManager.S_YOffsetPercent != null) uiManager.S_YOffsetPercent.Visibility = Visibility.Collapsed;
                 if (uiManager.S_XOffset != null) uiManager.S_XOffset.Visibility = Visibility.Collapsed;
                 if (uiManager.S_XOffsetPercent != null) uiManager.S_XOffsetPercent.Visibility = Visibility.Collapsed;
+                if (uiManager.S_OvershootDamping != null) uiManager.S_OvershootDamping.Visibility = Visibility.Collapsed;
+                if (uiManager.S_OvershootRecovery != null) uiManager.S_OvershootRecovery.Visibility = Visibility.Collapsed;
                 return;
             }
 
@@ -1357,6 +1359,14 @@ namespace Aimmy2
                 uiManager.S_YOffset.Visibility = yPercentEnabled ? Visibility.Collapsed : Visibility.Visible;
             if (uiManager.S_YOffsetPercent != null)
                 uiManager.S_YOffsetPercent.Visibility = yPercentEnabled ? Visibility.Visible : Visibility.Collapsed;
+
+            // Adaptive stability tuning: only meaningful (and only safe to fiddle with) while the
+            // adaptive controller is enabled.
+            bool adaptiveEnabled = Dictionary.toggleState["Adaptive Sensitivity Control"];
+            if (uiManager.S_OvershootDamping != null)
+                uiManager.S_OvershootDamping.Visibility = adaptiveEnabled ? Visibility.Visible : Visibility.Collapsed;
+            if (uiManager.S_OvershootRecovery != null)
+                uiManager.S_OvershootRecovery.Visibility = adaptiveEnabled ? Visibility.Visible : Visibility.Collapsed;
 
             // X Axis: Show pixel offset when toggle is OFF, percentage offset when toggle is ON
             bool xPercentEnabled = Dictionary.toggleState["X Axis Percentage Adjustment"];

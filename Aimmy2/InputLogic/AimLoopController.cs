@@ -1,282 +1,245 @@
-using Class;
+﻿using Class;
 
 namespace InputLogic
 {
     /// <summary>
-    /// Closed-loop gain governor for the aim controller.
+    /// Closed-loop stability controller for the aim controller.
     ///
-    /// WHY THIS EXISTS
-    /// ---------------
+    /// THE PROBLEM
+    /// -----------
     /// Aim assist is a feedback loop:
     ///
     ///     capture frame -> detect target -> error = target - crosshair -> move mouse -> game camera moves -> repeat
     ///
-    /// Every step of that loop has gain, and the total loop gain is
+    /// The aim code produces a movement in *mouse counts*, but the game decides how many *screen pixels*
+    /// one count is worth, using its own in-game sensitivity and the current optic. That conversion is
+    /// the plant gain:
     ///
-    ///     LoopGainPerTick   =  (1 - Sensitivity) * GamePixelsPerMouseCount
-    ///     LoopGainPerSecond =  LoopGainPerTick * updatesPerSecond
+    ///     loopGainPerTick = (fraction of the error removed per update) * pixelsPerCount
     ///
-    /// GamePixelsPerMouseCount is set by the game and grows steeply with optic magnification (a 4x
-    /// scope swings the view several times further per mouse count than 1x does), and DirectX runs
-    /// this loop far more times per second than GDI+ does, so the same settings that are stable at
-    /// 2x / GDI+ become borderline unstable at 4x / DirectX.
+    /// At low in-game sensitivity the product stays below 1 and the crosshair converges smoothly. At
+    /// high sensitivity the same counts swing the view several times further, the product passes 1, and
+    /// every correction overshoots. The crosshair then alternates either side of the target forever:
+    /// the relentless shaking that is only "fixed" by lowering the in-game sensitivity. The old tuning
+    /// knobs could not cure it because they change the fraction, not the product.
     ///
-    /// Past a loop gain of 1 the loop overshoots, then over-corrects, and settles into a limit cycle:
-    /// the crosshair swings back and forth across the target while the camera visibly "shakes".
-    /// That is exactly the symptom reported at 4x with DirectX capture.
+    /// WHY THERE IS NO SENSITIVITY MEASUREMENT
+    /// ---------------------------------------
+    /// The obvious fix is to measure pixels-per-count and cap the step in pixels. That measurement
+    /// cannot be trusted: the controller only sees the *combination* of its own movement and the
+    /// target's movement, so an enemy strafing is indistinguishable from a too-large mouse step. Trying
+    /// to learn it made aim lag behind moving targets badly. This class therefore uses no unit
+    /// assumptions at all - it adapts to whatever the loop is doing, which works for any game, optic
+    /// or sensitivity without knowing the conversion factor.
     ///
-    /// WHAT THIS CLASS DOES
-    /// --------------------
-    /// It measures the *quality* of the crosshair's recent motion instead of trusting the settings:
+    /// WHAT IT DOES
+    /// ------------
+    /// 1. SUPPRESSION. Any update that pushes towards the target and comes back past it is an
+    ///    overshoot. Each one cuts the allowed movement multiplicatively (halved by default, floor
+    ///    0.03), so the loop
+    ///    walks itself down to a gain that is stable on this particular setup within a few updates -
+    ///    usually 2 or 3, before the shake is even visible.
     ///
-    ///   pathLength = how far the crosshair was commanded to travel (integral of |error|)
-    ///   netTravel  = how far it actually got             (vector sum of error)
+    /// 2. RECOVERY. Movement is only given back after a run of clean updates, and only slowly, so the
+    ///    controller cannot see-saw between "suppress" and "release" while still oscillating. Without
+    ///    this the aim is permanently sluggish after one bad moment.
     ///
-    /// For a real aim move, netTravel ~= pathLength (the crosshair travels a straight-ish line to the
-    /// target). For a limit cycle the crosshair runs back and forth over the same spot, so pathLength
-    /// keeps growing while netTravel cancels out to ~0.
+    /// 3. QUANTISATION TOLERANCE. Mouse input has a minimum step of one count, and at high sensitivity
+    ///    a single count can be worth more pixels than the remaining error. Trying to hold a fixed 3 px
+    ///    lock on such a setup is physically impossible: every attempt lands one count past, which is
+    ///    corrected by one count back - the last, most stubborn part of the shake. When overshoots
+    ///    repeat (genuine chatter, not a flick) the lock-on radius grows to the amplitude actually
+    ///    observed. It relaxes back afterwards, so aim does not stay short.
     ///
-    /// When that cancellation is detected the per-tick gain is reduced (fast, multiplicative) and, as
-    /// soon as the motion becomes deliberate again, it is restored (slower, additive). The loop then
-    /// self-balances at whatever gain is stable for the current zoom, sensitivity and capture rate,
-    /// which removes the DirectX-vs-GDI+ difference instead of only masking it.
+    /// 4. FRAME-RATE NORMALISATION. The step is scaled by elapsed time, so behaviour is the same at 60
+    ///    and at 400 updates per second (DirectX capture produces far more than GDI+).
     ///
-    /// It also normalises the step size by elapsed time so the same settings converge at the same
-    /// *rate* regardless of how many frames per second the capture method delivers.
+    /// Learned values deliberately survive target loss: MouseManager.ResetMovement() runs on every frame
+    /// aim is idle, so clearing them there would restart the shake on every single trigger pull.
     /// </summary>
     internal static class AimLoopController
     {
-        // Per-tick gain applied to the commanded movement. 1.0 = untouched behaviour.
-        private const double MinGain = 0.16;
+        // ── Tunables, pushed in from the Aim Config sliders every update ──
+        private static bool _adaptiveEnabled = true;
+        private static double _keepAfterOvershoot = 0.5;
+        private static double _recovery = 0.35;
+
+        // ── Learned movement suppression: 1.0 = untouched, floor = very cautious ──
+        private static double _gain = 1.0;
+        private const double MinGain = 0.03;
         private const double MaxGain = 1.0;
+        private const double MinKeepAfterOvershoot = 0.15;
+        private const double MaxKeepAfterOvershoot = 0.85;
+        private const double RecoveryPerSecond = 0.9;
+        private const int CleanTicksBeforeRecovery = 4;
+        private const int MaxCleanTicks = 1000;
 
-        // How aggressively the gain is cut while chattering, and how fast it is given back.
-        // Recovery is deliberately gated: the gain only climbs again after this many consecutive
-        // updates of clean, meaningful aim travel, so it cannot saw-tooth back up mid-oscillation.
-        private const double GainCutPerTick = 0.12;
-        private const double GainRecoverPerSecond = 3.0;
-        private const int StableTicksBeforeRecovery = 6;
-
-        // Path-efficiency band. cycleRatio = netTravel / pathLength.
-        //   >= EfficientRatio (straight, deliberate aim)  -> full gain
-        //   <= NoisyRatio     (pure back-and-forth shake) -> minimum gain
-        private const double EfficientRatio = 0.50;
-        private const double NoisyRatio = 0.15;
-
-        // Errors below this are inside the lock-on deadzone and are ignored by the detector.
+        // ── Learned lock-on tolerance, in screen pixels ──
+        private static double _tolerancePx = DeadZonePx;
         private const double DeadZonePx = 3.0;
+        private const double MaxTolerancePx = 36.0;
+        private const double ToleranceDecayPerSecond = 2.0;
+        private const long ChatterWindowMs = 200;
+        private static long _lastOvershootMs = long.MinValue;
 
-        // Direct chatter detection: a move that instantly reverses. This catches the dangerous limit
-        // cycle in its first few updates instead of waiting for the rolling window to fill up.
-        // The threshold scales with the current error so ordinary detection-box jitter (a few px on
-        // top of a few px of error) cannot trip it - only a real back-and-forth of the aim can.
-        private const double ReversalMinStepPx = 3.0;
-        private const double ReversalMinStepRatio = 0.35;
-        private const double ReversalPenaltyGain = 0.35;
-        private const double ReversalPenaltyCap = 4.0;
-        private const double ReversalTrigger = 3.0;
-
-        // Time normalisation: step size is scaled towards this update period.
+        // ── Loop bookkeeping ──
         private const double ReferenceDtMs = 16.0;
         private const double MinDtScale = 0.70;
         private const double MaxDtScale = 2.00;
+        private const double MinCommandCounts = 0.5;
 
-        private static int _previousX = int.MinValue;
-        private static int _previousY = int.MinValue;
-        private static double _totalPath;
-        private static double _netX;
-        private static double _netY;
-        private static double _previousStepX;
-        private static double _previousStepY;
-        private static bool _hasPreviousStep;
-        private static double _reversalPenalty;
-        private static bool _priming = true;
-        private static int _primeTicks;
-        private static int _stableTicks;
-        private static double _gain = MaxGain;
+        private static double _pendingErrX;
+        private static double _pendingErrY;
+        private static double _pendingCmdX;
+        private static double _pendingCmdY;
+        private static bool _hasPending;
+
+        private static int _cleanTicks;
         private static long _lastTickMs = -1;
+        private static double _lastDtScale = 1.0;
 
-        /// <summary>Last computed per-tick gain (0..1). Exposed for diagnostics/UI.</summary>
+        public static bool IsAdaptiveEnabled => _adaptiveEnabled;
         public static double CurrentGain => _gain;
 
-        /// <summary>Last computed path-efficiency ratio (netTravel / pathLength).</summary>
-        public static double CurrentEfficiency { get; private set; } = 1.0;
+        /// <summary>
+        /// Radius around the target that counts as "locked on", in screen pixels. Grows when the setup
+        /// physically cannot resolve better than one mouse count, relaxes back when it can.
+        /// </summary>
+        public static double LockTolerancePixels => _adaptiveEnabled ? _tolerancePx : DeadZonePx;
 
         /// <summary>
-        /// Feeds one detected-target sample (screen coordinates) into the governor and updates the gain.
-        /// Call once per aim update, before the movement is computed.
+        /// Applies the Aim Config sliders. Called once per aim update, so dragging a slider takes
+        /// effect on the very next update.
         /// </summary>
-        public static void Evaluate(int detectedX, int detectedY)
+        public static void Configure(bool adaptive, double damping, double recovery)
         {
-            double halfW = WinAPICaller.ScreenWidth / 2.0;
-            double halfH = WinAPICaller.ScreenHeight / 2.0;
-            double errX = detectedX - halfW;
-            double errY = detectedY - halfH;
-            double magnitude = Math.Sqrt(errX * errX + errY * errY);
+            _adaptiveEnabled = adaptive;
 
+            // "Damping" is how much of the movement is taken away after an overshoot: 0.5 keeps half
+            // (halves it), higher cuts harder and settles calmer, lower is snappier but can ring.
+            _keepAfterOvershoot = Math.Clamp(1.0 - damping, MinKeepAfterOvershoot, MaxKeepAfterOvershoot);
+
+            _recovery = Math.Clamp(recovery, 0.05, 1.0);
+        }
+
+        /// <summary>
+        /// Feeds one measured target error (screen pixels, relative to the crosshair) into the
+        /// controller. Call once per aim update, before this update's movement is computed.
+        /// </summary>
+        public static void Evaluate(double errX, double errY)
+        {
             long now = Environment.TickCount64;
             double dtMs = _lastTickMs < 0 ? ReferenceDtMs : Math.Clamp(now - _lastTickMs, 0.5, 100.0);
             _lastTickMs = now;
 
-            // ── Prime after (re)acquisition ──
-            // The first few ticks after the crosshair snaps onto a target contain a huge, deliberate
-            // move. Measuring it would look like noise, so ignore it and start clean.
-            if (_priming || _previousX == int.MinValue)
+            // Normalised once per update and reused by StepScale(), so the two can never disagree.
+            // (StepScale used to read the clock again after Evaluate had just set it, get ~0 ms and
+            // pin the scale at its floor, permanently weakening every movement.)
+            _lastDtScale = Math.Clamp(dtMs / ReferenceDtMs, MinDtScale, MaxDtScale);
+
+            double magnitude = Math.Sqrt(errX * errX + errY * errY);
+
+            if (_hasPending)
             {
-                if (++_primeTicks >= 3)
+                double cmdMagnitude = Math.Sqrt(_pendingCmdX * _pendingCmdX + _pendingCmdY * _pendingCmdY);
+
+                if (cmdMagnitude >= MinCommandCounts)
                 {
-                    _priming = false;
+                    double inv = 1.0 / cmdMagnitude;
+                    double dirX = _pendingCmdX * inv;
+                    double dirY = _pendingCmdY * inv;
+
+                    // Error measured along the direction we pushed on the previous update.
+                    //   > 0 : still short of the target
+                    //   < 0 : we went past it
+                    double errorBefore = _pendingErrX * dirX + _pendingErrY * dirY;
+                    double errorNow = errX * dirX + errY * dirY;
+
+                    // A real overshoot has to come back *past* the tolerance; merely crossing zero is
+                    // within the noise of the detector and of a target that is moving.
+                    if (errorBefore > _tolerancePx && errorNow < -_tolerancePx)
+                    {
+                        _gain = Math.Max(MinGain, _gain * _keepAfterOvershoot);
+
+                        // Widen the lock-on radius only when overshoots repeat - that is genuine
+                        // chatter. A single overshoot (a flick, or a target running past the
+                        // crosshair) must not leave aim permanently stopping short of the target.
+                        if (_lastOvershootMs != long.MinValue && now - _lastOvershootMs <= ChatterWindowMs)
+                        {
+                            _tolerancePx = Math.Min(MaxTolerancePx, Math.Max(_tolerancePx, Math.Abs(errorNow)));
+                        }
+
+                        _lastOvershootMs = now;
+                        _cleanTicks = 0;
+                    }
+                    else if (_cleanTicks < MaxCleanTicks)
+                    {
+                        _cleanTicks++;
+                    }
                 }
-                _previousX = detectedX;
-                _previousY = detectedY;
-                _totalPath = 0;
-                _netX = 0;
-                _netY = 0;
-                _stableTicks = StableTicksBeforeRecovery;
-                RecoverGain(dtMs);
-                return;
+
+                _hasPending = false;
             }
 
-            if (magnitude < DeadZonePx)
+            // Give movement back slowly, and only after a run of clean updates (or while locked on,
+            // where no command is being issued and nothing can oscillate).
+            if (_cleanTicks >= CleanTicksBeforeRecovery || magnitude < _tolerancePx)
             {
-                // Locked on: no command is being issued, so nothing can oscillate. Let the gain recover.
-                _totalPath = 0;
-                _netX = 0;
-                _netY = 0;
-                _previousX = detectedX;
-                _previousY = detectedY;
-                _hasPreviousStep = false;
-                _reversalPenalty = Math.Max(0.0, _reversalPenalty - 0.5);
-                _stableTicks = StableTicksBeforeRecovery;
-                RecoverGain(dtMs);
-                return;
+                _gain = Math.Min(MaxGain, _gain + RecoveryPerSecond * _recovery * (dtMs / 1000.0));
             }
 
-            double stepX = errX - (_previousX - halfW);
-            double stepY = errY - (_previousY - halfH);
-            double step = Math.Sqrt(stepX * stepX + stepY * stepY);
-
-            // ── Direct chatter detection ──
-            // A move that immediately reverses, repeatedly, cannot be aim: it is the loop fighting
-            // itself. The step must also be significant compared to the current error, otherwise
-            // ordinary bounding-box noise would be mistaken for oscillation.
-            if (_hasPreviousStep)
+            // Relax the lock-on radius while calm, so it tracks a sensitivity or optic change instead
+            // of staying at whatever it once had to grow to.
+            if (magnitude < _tolerancePx)
             {
-                double dot = stepX * _previousStepX + stepY * _previousStepY;
-                double reversalThreshold = Math.Max(ReversalMinStepPx, ReversalMinStepRatio * magnitude);
-                if (dot < 0 && step > reversalThreshold)
-                {
-                    _reversalPenalty = Math.Min(ReversalPenaltyCap, _reversalPenalty + 1.0);
-                }
-                else
-                {
-                    _reversalPenalty = Math.Max(0.0, _reversalPenalty - 0.25);
-                }
-            }
-
-            _previousStepX = stepX;
-            _previousStepY = stepY;
-            _hasPreviousStep = true;
-
-            if (_reversalPenalty >= ReversalTrigger)
-            {
-                double rateScale = Math.Clamp(dtMs / ReferenceDtMs, 0.25, 4.0);
-                _gain = Math.Max(MinGain, _gain - ReversalPenaltyGain * rateScale);
-            }
-
-            // Rolling window (kept in "error units", which are screen pixels).
-            _totalPath += step;
-            _netX += stepX;
-            _netY += stepY;
-
-            // Decay so the window tracks recent behaviour (~0.25 s at 60 Hz).
-            double decay = Math.Exp(-dtMs / 250.0);
-            _totalPath *= decay;
-            _netX *= decay;
-            _netY *= decay;
-
-            _previousX = detectedX;
-            _previousY = detectedY;
-
-            double net = Math.Sqrt(_netX * _netX + _netY * _netY);
-
-            // Only judge efficiency once enough motion has accumulated to be meaningful.
-            if ((_totalPath < magnitude * 2.0 || _totalPath < 20.0) && _reversalPenalty < 2.0)
-            {
-                CurrentEfficiency = 1.0;
-                _stableTicks = StableTicksBeforeRecovery;
-                RecoverGain(dtMs);
-                return;
-            }
-
-            double efficiency = Math.Clamp(net / _totalPath, 0.0, 1.0);
-            CurrentEfficiency = efficiency;
-
-            if (efficiency >= EfficientRatio && _reversalPenalty < 1.0)
-            {
-                // Deliberate travel: this update counts towards giving the gain back.
-                _stableTicks++;
-                RecoverGain(dtMs);
-            }
-            else if (efficiency <= NoisyRatio)
-            {
-                // Chattering in place: cut the gain, proportionally to the update rate so the
-                // suppression rate is the same on DirectX (many updates/s) and GDI+ (fewer).
-                _stableTicks = 0;
-                double rateScale = Math.Clamp(dtMs / ReferenceDtMs, 0.25, 4.0);
-                _gain = Math.Max(MinGain, _gain - GainCutPerTick * rateScale);
-            }
-            else
-            {
-                // Transition band: bias towards stability without slamming the gain.
-                _stableTicks = 0;
-                double t = Math.Clamp((efficiency - NoisyRatio) / (EfficientRatio - NoisyRatio), 0.0, 1.0);
-                double target = MinGain + t * (MaxGain - MinGain);
-                _gain += (target - _gain) * 0.25;
-                _gain = Math.Clamp(_gain, MinGain, MaxGain);
+                _tolerancePx = Math.Max(DeadZonePx, _tolerancePx - ToleranceDecayPerSecond * (dtMs / 1000.0));
             }
         }
 
         /// <summary>
-        /// Gives gain back only after a run of clean updates, so a limit cycle cannot saw-tooth
-        /// between "suppress" and "release" while it is still oscillating.
+        /// Fraction of the remaining error this update is allowed to try to remove. Bounded by the
+        /// user's stability ceiling so no slider combination can ask for more than the loop can take.
         /// </summary>
-        private static void RecoverGain(double dtMs)
+        public static double EffectiveLoopFraction(double sensitivitySetting)
         {
-            if (_stableTicks < StableTicksBeforeRecovery) return;
-            _gain = Math.Min(MaxGain, _gain + GainRecoverPerSecond * (dtMs / 1000.0));
+            // The user's own sensitivity, reduced by whatever the loop has learned it must hold back.
+            // With the controller disabled _gain stays at 1.0, so this is exactly the old behaviour.
+            double fraction = Math.Clamp(1.0 - sensitivitySetting, 0.02, 1.0) * _gain;
+            return Math.Clamp(fraction, 0.01, 0.95);
         }
 
         /// <summary>
-        /// Frame-rate compensation: returns the multiplier that turns a fixed per-update step into a
-        /// step that depends on how long the previous update took, so the loop converges at the same
-        /// speed whether the capture method delivers 60 or 400 updates per second.
+        /// Records the command that was actually sent, so the next Evaluate() can judge its result.
         /// </summary>
-        public static double StepScale()
+        public static void RecordCommand(double errX, double errY, double cmdX, double cmdY)
         {
-            long now = Environment.TickCount64;
-            if (_lastTickMs < 0) return 1.0;
-            double dtMs = Math.Clamp(now - _lastTickMs, 1.0, 60.0);
-            return Math.Clamp(dtMs / ReferenceDtMs, MinDtScale, MaxDtScale);
+            _pendingErrX = errX;
+            _pendingErrY = errY;
+            _pendingCmdX = cmdX;
+            _pendingCmdY = cmdY;
+            _hasPending = true;
         }
 
+        /// <summary>
+        /// Frame-rate compensation for the current update (computed once per update in Evaluate()).
+        /// </summary>
+        public static double StepScale() => _lastDtScale;
+
+        /// <summary>
+        /// Clears per-target state. The learned gain and tolerance are intentionally kept, because this
+        /// is called on every frame that aim is idle and re-learning from scratch each time the user
+        /// holds the aim key would reproduce the shake on every engagement.
+        /// </summary>
         public static void Reset()
         {
-            _previousX = int.MinValue;
-            _previousY = int.MinValue;
-            _totalPath = 0;
-            _netX = 0;
-            _netY = 0;
-            _previousStepX = 0;
-            _previousStepY = 0;
-            _hasPreviousStep = false;
-            _reversalPenalty = 0;
-            _priming = true;
-            _primeTicks = 0;
-            _stableTicks = 0;
-            _gain = MaxGain;
+            _pendingErrX = 0.0;
+            _pendingErrY = 0.0;
+            _pendingCmdX = 0.0;
+            _pendingCmdY = 0.0;
+            _hasPending = false;
+            _cleanTicks = 0;
             _lastTickMs = -1;
-            CurrentEfficiency = 1.0;
+            _lastDtScale = 1.0;
         }
     }
 }

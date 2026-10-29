@@ -1,4 +1,4 @@
-using Aimmy2.UILibrary;
+﻿using Aimmy2.UILibrary;
 using System.Windows.Controls;
 using UILibrary;
 
@@ -44,6 +44,9 @@ namespace Class
         public ADropdown? D_AimingBoundariesAlignment { get; set; }
         public ADropdown? D_TargetClass { get; set; }
         public ASlider? S_MouseSensitivity { get; set; }
+        public AToggle? T_AdaptiveSensitivity { get; set; }
+        public ASlider? S_OvershootDamping { get; set; }
+        public ASlider? S_OvershootRecovery { get; set; }
         public ASlider? S_MouseJitter { get; set; }
         public ASlider? S_StickyAimThreshold { get; set; }
         public ASlider? S_YOffset { get; set; }
