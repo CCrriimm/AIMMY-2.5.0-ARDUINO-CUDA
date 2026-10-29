@@ -1,4 +1,4 @@
-using Visuality;
+﻿using Visuality;
 
 namespace Aimmy2.Class
 {
@@ -39,6 +39,8 @@ namespace Aimmy2.Class
             { "X Offset (%)", 50 },
             { "EMA Smoothening", 0.37 },
             { "Accelerated Smoothing", 1.0 },
+            { "Overshoot Damping", 0.5 },
+            { "Overshoot Recovery", 0.35 },
             { "Kalman Lead Time", 0.10 },
             { "WiseTheFox Lead Time", 0.15 },
             { "Shalloe Lead Multiplier", 3.0 },
@@ -63,6 +65,7 @@ namespace Aimmy2.Class
             { "Prediction Pixel Offset Enabled", false },
             { "EMA Smoothening", false },
             { "Accelerated Smoothing", false },
+            { "Adaptive Sensitivity Control", true },
             { "Enable Model Switch Keybind", true },
             { "Auto Trigger", false },
             { "FOV", false },

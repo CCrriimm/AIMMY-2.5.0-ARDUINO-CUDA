@@ -1,66 +1,100 @@
-#not sure if im doing this right lol
-name: .NET Core Desktop
+name: Build (Windows)
+
+# Compiles the WPF application on a real Windows runner so that code changes are
+# verified by the compiler on every push and pull request, instead of only being
+# discovered when someone opens the solution locally.
+#
+# The previous version of this file never ran: it was triggered on a branch called
+# "Aimmy-V2" (this repository uses "Aimmy-V2-CUDA"), and it passed an undefined
+# $env:Solution_Path to msbuild, so it would have failed even if it had matched.
 
 on:
   push:
-    branches: [ "Aimmy-V2" ]
+    branches:
+      - Aimmy-V2-CUDA
   pull_request:
-    branches: [ "Aimmy-V2" ]
-    paths-ignore:
-      - 'models/**'
-      - 'configs/**'
+    branches:
+      - Aimmy-V2-CUDA
+  workflow_dispatch:
+
+# A new push to the same branch makes an in-flight build obsolete.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  PROJECT: Aimmy2/Aimmy2.csproj
+  CONFIGURATION: Release
+  PLATFORM: x64
 
 jobs:
-
   build:
-    strategy:
-      matrix:
-        targetplatform: [x64]
-        configuration: [Release]
+    name: Build x64 Release
+    runs-on: windows-latest
 
-    runs-on: windows-latest  # For a list of available runner types, refer to
-                             # https://help.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idruns-on
-
-    env:
-      Solution_Name: Aimmy2.sln                         # Replace with your solution name, i.e. MyWpfApp.sln.
-      Wpf_Project_Path: Aimmy2\Aimmy2.csproj
-      #Wap_Project_Name: MyWpfApp.Package.wapproj
-      
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout
+        uses: actions/checkout@v7
 
-    # Install the .NET Core workload
-    - name: Install .NET Core
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: 8.0.x
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
 
-    # Add  MSBuild to the PATH: https://github.com/microsoft/setup-msbuild
-    - name: Setup MSBuild.exe
-      uses: microsoft/setup-msbuild@v2
+      # The ONNX Runtime GPU package is large; caching it keeps runs short.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/Aimmy2.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
 
-    # Restore the application
-    - name:  Restore the Wpf application to populate the obj folder
-      run: msbuild $env:Solution_Path /t:Restore /p:Configuration=$env:Configuration /p:RuntimeIdentifier=$env:RuntimeIdentifier
-      env:
-        Configuration: Debug
-        RuntimeIdentifier: win-${{ matrix.targetplatform }}
-        
-    # Build the Windows Application Packaging project
-    - name: Build release x64
-      run: msbuild $env:Solution_Path /p:Platform=$env:TargetPlatform /p:Configuration=$env:Configuration /p:UapAppxPackageBuildMode=$env:BuildMode /p:AppxBundle=$env:AppxBundle /p:PackageCertificateKeyFile=$env:SigningCertificate /p:PackageCertificatePassword=${{ secrets.Pfx_Key }}
-      env:
-        AppxBundle: Never
-        BuildMode: SideLoadOnly
-        Configuration: Release
-        TargetPlatform: ${{ matrix.targetplatform }}
+      - name: Restore
+        run: dotnet restore "$env:PROJECT" -p:Platform=$env:PLATFORM -p:Configuration=$env:CONFIGURATION
 
-    # Upload the MSIX package: https://github.com/marketplace/actions/upload-a-build-artifact
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: aimmyidk
-        path: Aimmy2\bin\x64\Release\
+      # Fody normally generates FodyWeavers.xsd as a build artifact. It is listed in
+      # .gitignore, so make sure a stale copy can never break the build.
+      - name: Remove regenerated Fody schema
+        run: |
+          if (Test-Path "Aimmy2/FodyWeavers.xsd") { Remove-Item "Aimmy2/FodyWeavers.xsd" -Force }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          # Build once, keeping the log so the diagnostics step does not have to rebuild.
+          dotnet build "$env:PROJECT" --configuration $env:CONFIGURATION --no-restore `
+            -p:Platform=$env:PLATFORM -v:normal 2>&1 | Tee-Object -FilePath build.log
+          exit $LASTEXITCODE
+
+      - name: Show compiler diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          # Surface the errors/warnings in the job summary so a failure is readable
+          # without digging through the raw log.
+          if (-not (Test-Path build.log)) {
+            "No build log produced." | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            exit 0
+          }
+          $diag = Select-String -Path build.log -Pattern '(error|warning) (CS|MSB|NETSDK|WPF)\d+' |
+                  ForEach-Object { $_.Line.Trim() } | Sort-Object -Unique | Select-Object -First 100
+          if ($diag) {
+            "### Compiler diagnostics" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            '```' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            $diag | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            '```' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          } else {
+            "### Compiler diagnostics`nNone - build is clean." | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: AntiGravity-${{ env.PLATFORM }}-${{ env.CONFIGURATION }}
+          path: Aimmy2/bin/${{ env.PLATFORM }}/${{ env.CONFIGURATION }}/net8.0-windows/
+          if-no-files-found: warn
+          retention-days: 7

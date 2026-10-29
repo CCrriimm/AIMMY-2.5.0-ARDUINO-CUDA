@@ -394,6 +394,15 @@ namespace Aimmy2.Controls
                                 "The Mouse Sensitivity you have set can cause AntiGravity to be unstable to aim, please increase if you suffer from this problem", true);
                     };
                 }, tooltip: "How fast the aim moves. Lower = faster and snappier, higher = slower and smoother.")
+                .AddToggle("Adaptive Sensitivity Control", t =>
+                {
+                    uiManager.T_AdaptiveSensitivity = t;
+                    t.Reader.Click += (s, e) => _mainWindow?.UpdateAimConfigSliderVisibility();
+                }, tooltip: "Measures how your in-game sensitivity turns mouse counts into screen pixels and limits each aim step to a safe number of pixels. Keep this on for high in-game sensitivity - it is what stops the crosshair shaking.")
+                .AddSlider("Overshoot Damping", "Damping", 0.01, 0.01, 0.05, 0.95, s => uiManager.S_OvershootDamping = s,
+                    tooltip: "How hard aim slows down every time it overshoots the target. 0.5 halves it. Raise this if the crosshair still shakes with high in-game sensitivity; lower it if aim feels too timid.")
+                .AddSlider("Overshoot Recovery", "Speed", 0.01, 0.01, 0.05, 1.0, s => uiManager.S_OvershootRecovery = s,
+                    tooltip: "How quickly aim speed is given back after an overshoot is detected. Lower = calm and steady when the crosshair starts oscillating.")
                 .AddSlider("Mouse Jitter", "Jitter", 1, 1, 0, 15, s => uiManager.S_MouseJitter = s,
                     tooltip: "Adds random small movements to make aim look more human-like.")
                 .AddToggle("Y Axis Percentage Adjustment", t => uiManager.T_YAxisPercentageAdjustment = t,

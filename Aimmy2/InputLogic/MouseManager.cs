@@ -1,4 +1,4 @@
-using Aimmy2.Class;
+﻿using Aimmy2.Class;
 using Class;
 using System.Drawing;
 using System.Runtime.InteropServices;
@@ -215,13 +215,6 @@ namespace InputLogic
 
         public static void MoveCrosshair(int detectedX, int detectedY)
         {
-            // Feed the detection into the closed-loop governor first: it measures whether the
-            // crosshair is actually travelling towards the target or chattering on the spot, and
-            // scales the step accordingly. See AimLoopController for the full explanation.
-            AimLoopController.Evaluate(detectedX, detectedY);
-            double loopGain = AimLoopController.CurrentGain;
-            double dtScale = AimLoopController.StepScale();
-
             int halfScreenWidth = (int)ScreenWidth / 2;
             int halfScreenHeight = (int)ScreenHeight / 2;
 
@@ -288,8 +281,23 @@ namespace InputLogic
             double targetY = filteredTargetY;
             double dist = Math.Sqrt(targetX * targetX + targetY * targetY);
 
+            // ── Stage 1b: Closed-loop stability controller ──
+            // Push the current tuning in, hand it this tick's measured error, and take its verdict on
+            // how much of that error we are allowed to try to remove. See AimLoopController.
+            AimLoopController.Configure(
+                Dictionary.toggleState["Adaptive Sensitivity Control"],
+                Convert.ToDouble(Dictionary.sliderSettings["Overshoot Damping"]),
+                Convert.ToDouble(Dictionary.sliderSettings["Overshoot Recovery"]));
+
+            AimLoopController.Evaluate(targetX, targetY);
+            double dtScale = AimLoopController.StepScale();
+
             // ── Stage 2: Lock-on Deadzone & Smoothstep Dampening ──
-            const double DeadzoneRadius = 3.0;
+            // The radius is not a constant any more: one mouse count moves the view further on a high
+            // in-game sensitivity, so a fixed 3 px deadzone can be smaller than a single minimum
+            // command and the crosshair chatters ±1 count around the target forever. The controller
+            // scales the tolerance with the learned pixels-per-count. See LockTolerancePixels.
+            double DeadzoneRadius = AimLoopController.LockTolerancePixels;
             const double DampeningRadius = 18.0;
 
             if (dist <= DeadzoneRadius)
@@ -301,6 +309,8 @@ namespace InputLogic
                 oscillationCounter = 0;
                 lastTargetX = targetX;
                 lastTargetY = targetY;
+                // Locked on: nothing was commanded, so there is no overshoot to learn from.
+                AimLoopController.RecordCommand(targetX, targetY, 0, 0);
                 return;
             }
 
@@ -325,9 +335,10 @@ namespace InputLogic
             Point newPosition = new Point(0, 0);
 
             double sensSetting = Convert.ToDouble(Dictionary.sliderSettings["Mouse Sensitivity (+/-)"]);
-            // The user's sensitivity is the *nominal* per-tick proportional gain; the governor caps
-            // the effective gain so the loop stays stable at high zoom / high capture rates.
-            double sensFactor = (1.0 - sensSetting) * loopGain;
+            // The step is a fraction of the remaining error. The controller supplies that fraction:
+            // the user's sensitivity, bounded by the stability ceiling and reduced further whenever
+            // the loop has been overshooting. This is what makes high in-game sensitivity usable.
+            double sensFactor = AimLoopController.EffectiveLoopFraction(sensSetting);
 
             switch (Dictionary.dropdownState["Movement Path"])
             {
@@ -448,20 +459,12 @@ namespace InputLogic
             posX *= dtScale;
             posY *= dtScale;
 
-            // ── Stage 9: Motion-derivative cap ──
-            // Proportional aim carries a fixed fraction of the *whole* remaining error every update.
-            // That fraction is the loop gain, and the loop gain is multiplied by the game's own
-            // sensitivity for the current optic - a 4x scope moves the view several times further per
-            // mouse count than 1x does. The product can pass 1, at which point one correction
-            // overshoots the target, the next overshoots further back, and the crosshair chatters
-            // across the target at high frequency (the reported 4x "shake").
-            //
-            // Capping the size of a single step relative to the *measured* distance to the target
-            // keeps the motion derivative bounded no matter how much the game scales the input, so
-            // the loop can never overshoot in one update. It also doubles as a command-rate limiter
-            // for the Arduino transport: large moves spread over a few updates instead of one burst,
-            // which is easier on the controller's HID input rate and on the game's input smoothing.
-            if (dist > 0)
+            // ── Stage 9: Legacy cap, only when the adaptive controller is switched off ──
+            // With the controller on, the fraction supplied above is already bounded by the stability
+            // ceiling and reduced by every observed overshoot, so no further cap is needed (and the
+            // old one was actively harmful: it compared mouse counts against a distance in pixels, so
+            // its 6-count floor was itself a huge jump on a high-sensitivity setup).
+            if (!AimLoopController.IsAdaptiveEnabled && dist > 0)
             {
                 double maxStep = Math.Max(MinStepCapPx, dist * MaxStepRatio);
                 if (Math.Abs(posX) > maxStep) posX = Math.Sign(posX) * maxStep;
@@ -477,6 +480,10 @@ namespace InputLogic
 
             subPixelX = totalX - moveX;
             subPixelY = totalY - moveY;
+
+            // Tell the controller what was actually commanded, so on the next update it can judge
+            // whether that command overshot - which is how it finds the stable gain for this setup.
+            AimLoopController.RecordCommand(targetX, targetY, moveX, moveY);
 
             if (moveX != 0 || moveY != 0)
             {
