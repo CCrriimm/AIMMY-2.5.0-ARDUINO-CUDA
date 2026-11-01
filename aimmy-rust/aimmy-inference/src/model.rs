@@ -9,7 +9,7 @@ use crate::preprocess::bgra8_to_float_planar;
 use crate::predictors::{
     ema::EmaPredictor, kalman::KalmanFilter, shalloe::ShalloePredictor, PredictionMethod,
 };
-use ndarray::{Array, Ix3};
+use ndarray::{Array, Ix3, Ix4};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -62,10 +62,14 @@ pub struct InferenceResult {
 
 /// ONNX model session abstraction.
 ///
-/// On Windows this wraps `onnxruntime` behind the `onnx` feature; on other
-/// platforms it is a stub so the crate compiles everywhere.
+/// On Windows with the `onnx` feature this wraps a real `onnxruntime::Session`
+/// backed by the selected execution provider (CUDA / DirectML / TensorRT / CPU).
+/// On other platforms or without the feature it is a stub so the crate still
+/// compiles.
 pub struct OnnxSession {
     #[cfg(all(target_os = "windows", feature = "onnx"))]
+    inner: Option<onnxruntime::session::Session>,
+    #[cfg(not(all(target_os = "windows", feature = "onnx")))]
     inner: Option<()>,
     input_name: String,
     image_size: usize,
@@ -75,6 +79,10 @@ pub struct OnnxSession {
     classes: HashMap<i32, String>,
     provider: ExecutionProvider,
     dynamic: bool,
+    #[cfg(all(target_os = "windows", feature = "onnx"))]
+    environment: Option<onnxruntime::environment::Environment>,
+    #[cfg(not(all(target_os = "windows", feature = "onnx")))]
+    environment: Option<()>,
 }
 
 impl Default for OnnxSession {
@@ -88,6 +96,8 @@ impl OnnxSession {
         Self {
             #[cfg(all(target_os = "windows", feature = "onnx"))]
             inner: None,
+            #[cfg(not(all(target_os = "windows", feature = "onnx")))]
+            inner: None,
             input_name: "images".into(),
             image_size: 640,
             num_detections: 8400,
@@ -96,6 +106,10 @@ impl OnnxSession {
             classes: HashMap::from([(0, "enemy".into())]),
             provider: ExecutionProvider::Cpu,
             dynamic: false,
+            #[cfg(all(target_os = "windows", feature = "onnx"))]
+            environment: None,
+            #[cfg(not(all(target_os = "windows", feature = "onnx")))]
+            environment: None,
         }
     }
 
@@ -144,28 +158,104 @@ impl OnnxSession {
         false
     }
 
+    /// Create an ONNX Runtime environment (shared across sessions).
     #[cfg(all(target_os = "windows", feature = "onnx"))]
-    fn try_tensorrt(&mut self, _path: &Path) -> bool {
-        LogManager::warn("TensorRT requires onnxruntime built with the TensorRT EP.");
-        false
+    fn environment(&mut self) -> Result<&onnxruntime::environment::Environment, String> {
+        if self.environment.is_none() {
+            self.environment = Some(
+                onnxruntime::environment::Environment::builder()
+                    .with_name("aimmy")
+                    .build()
+                    .map_err(|e| format!("Failed to create ONNX environment: {}", e))?,
+            );
+        }
+        Ok(self.environment.as_ref().unwrap())
     }
 
-    #[cfg(all(target_os = "windows", feature = "onnx"))]
+    #[cfg(not(all(target_os = "windows", feature = "onnx")))]
+    fn environment(&mut self) -> Result<&(), String> {
+        Err("ONNX Runtime is only available on Windows with the `onnx` feature.".into())
+    }
+
+    /// Try loading with the CUDA execution provider.
+    #[cfg(all(target_os = "windows", feature = "onnx", feature = "onnx-cuda"))]
+    fn try_cuda(&mut self, path: &Path) -> bool {
+        match self.create_session(path, ExecutionProvider::Cuda) {
+            Ok(()) => {
+                LogManager::info("Successfully initialized ONNX session with CUDA execution provider.");
+                true
+            }
+            Err(e) => {
+                LogManager::warn(&format!("CUDA provider unavailable: {}", e));
+                false
+            }
+        }
+    }
+
+    /// Try loading with the CUDA execution provider (feature disabled stub).
+    #[cfg(all(target_os = "windows", feature = "onnx"), not(feature = "onnx-cuda"))]
     fn try_cuda(&mut self, _path: &Path) -> bool {
-        LogManager::info("Attempting CUDA execution provider.");
+        LogManager::warn("CUDA execution provider not compiled in. Rebuild with --features aimmy-inference/onnx-cuda.");
         false
     }
 
-    #[cfg(all(target_os = "windows", feature = "onnx"))]
+    /// Try loading with the DirectML execution provider.
+    #[cfg(all(target_os = "windows", feature = "onnx", feature = "onnx-directml"))]
+    fn try_dml(&mut self, path: &Path) -> bool {
+        match self.create_session(path, ExecutionProvider::DirectML) {
+            Ok(()) => {
+                LogManager::info("Successfully initialized ONNX session with DirectML execution provider.");
+                true
+            }
+            Err(e) => {
+                LogManager::warn(&format!("DirectML provider unavailable: {}", e));
+                false
+            }
+        }
+    }
+
+    /// Try loading with DirectML (feature disabled stub).
+    #[cfg(all(target_os = "windows", feature = "onnx"), not(feature = "onnx-directml"))]
     fn try_dml(&mut self, _path: &Path) -> bool {
-        LogManager::info("Attempting DirectML execution provider.");
+        LogManager::warn("DirectML execution provider not compiled in. Rebuild with --features aimmy-inference/onnx-directml.");
         false
     }
 
-    #[cfg(all(target_os = "windows", feature = "onnx"))]
-    fn try_cpu(&mut self, _path: &Path) -> bool {
-        LogManager::info("Attempting CPU execution provider.");
+    /// Try loading with the TensorRT execution provider.
+    #[cfg(all(target_os = "windows", feature = "onnx", feature = "onnx-tensorrt"))]
+    fn try_tensorrt(&mut self, path: &Path) -> bool {
+        match self.create_session(path, ExecutionProvider::TensorRT) {
+            Ok(()) => {
+                LogManager::info("Successfully initialized ONNX session with TensorRT execution provider.");
+                true
+            }
+            Err(e) => {
+                LogManager::warn(&format!("TensorRT provider unavailable: {}", e));
+                false
+            }
+        }
+    }
+
+    /// Try loading with TensorRT (feature disabled stub).
+    #[cfg(all(target_os = "windows", feature = "onnx"), not(feature = "onnx-tensorrt"))]
+    fn try_tensorrt(&mut self, _path: &Path) -> bool {
+        LogManager::warn("TensorRT execution provider not compiled in. Rebuild with --features aimmy-inference/onnx-tensorrt.");
         false
+    }
+
+    /// Try loading with the CPU execution provider (always available).
+    #[cfg(all(target_os = "windows", feature = "onnx"))]
+    fn try_cpu(&mut self, path: &Path) -> bool {
+        match self.create_session(path, ExecutionProvider::Cpu) {
+            Ok(()) => {
+                LogManager::warn("Initialized ONNX session with CPU execution provider (performance will be reduced).");
+                true
+            }
+            Err(e) => {
+                LogManager::error(&format!("Error loading model via CPU: {}", e));
+                false
+            }
+        }
     }
 
     #[cfg(not(all(target_os = "windows", feature = "onnx")))]
@@ -183,6 +273,111 @@ impl OnnxSession {
     #[cfg(not(all(target_os = "windows", feature = "onnx")))]
     fn try_cpu(&mut self, _path: &Path) -> bool {
         false
+    }
+
+    /// Internal: build a session for the given provider.
+    #[cfg(all(target_os = "windows", feature = "onnx"))]
+    fn create_session(&mut self, path: &Path, provider: ExecutionProvider) -> Result<(), String> {
+        let env = self.environment()?;
+        let mut builder = onnxruntime::session::Session::builder()?;
+        builder
+            .with_intra_op_num_threads(4)
+            .map_err(|e| format!("Failed to set intra op threads: {}", e))?;
+        builder
+            .with_inter_op_num_threads(1)
+            .map_err(|e| format!("Failed to set inter op threads: {}", e))?;
+        builder
+            .with_graph_optimization_level(onnxruntime::GraphOptimizationLevel::OrtEnableAll)
+            .map_err(|e| format!("Failed to set graph optimization: {}", e))?;
+
+        match provider {
+            ExecutionProvider::Cuda => {
+                #[cfg(feature = "onnx-cuda")]
+                builder.with_cuda().map_err(|e| format!("Failed to enable CUDA EP: {}", e))?;
+                #[cfg(not(feature = "onnx-cuda"))]
+                return Err("CUDA feature not enabled".into());
+            }
+            ExecutionProvider::DirectML => {
+                #[cfg(feature = "onnx-directml")]
+                builder
+                    .with_dml()
+                    .map_err(|e| format!("Failed to enable DirectML EP: {}", e))?;
+                #[cfg(not(feature = "onnx-directml"))]
+                return Err("DirectML feature not enabled".into());
+            }
+            ExecutionProvider::TensorRT => {
+                #[cfg(feature = "onnx-tensorrt")]
+                builder
+                    .with_tensorrt()
+                    .map_err(|e| format!("Failed to enable TensorRT EP: {}", e))?;
+                #[cfg(not(feature = "onnx-tensorrt"))]
+                return Err("TensorRT feature not enabled".into());
+            }
+            ExecutionProvider::Cpu => {
+                // CPU is the default provider; nothing extra needed.
+            }
+        }
+
+        let session = builder
+            .commit(env, path)
+            .map_err(|e| format!("Failed to commit ONNX session: {}", e))?;
+
+        // Query input/output metadata.
+        let input_meta = session.inputs();
+        let output_meta = session.outputs();
+
+        self.input_name = input_meta
+            .first()
+            .map(|i| i.name.to_string())
+            .unwrap_or_else(|| "images".into());
+
+        // Detect output format from shape.
+        if let Some(out) = output_meta.first() {
+            let dims: Vec<usize> = out.dimensions().to_vec();
+            self.format = detect_output_format(&dims);
+            self.num_classes = infer_num_classes(&dims, self.format);
+        }
+
+        self.inner = Some(session);
+        Ok(())
+    }
+
+    #[cfg(not(all(target_os = "windows", feature = "onnx")))]
+    fn create_session(&mut self, _path: &Path, _provider: ExecutionProvider) -> Result<(), String> {
+        Err("ONNX Runtime is only available on Windows with the `onnx` feature.".into())
+    }
+
+    /// Run inference on a preprocessed NCHW float tensor and return the raw
+    /// output as a flat f32 vector.
+    #[cfg(all(target_os = "windows", feature = "onnx"))]
+    pub fn run(&self, input: Array<f32, Ix4>) -> Result<Vec<f32>, String> {
+        let session = self.inner.as_ref().ok_or("Session not initialized")?;
+
+        let dims = input.shape();
+        let input_tensor = onnxruntime::Tensor::from_array(
+            self.environment.as_ref().unwrap(),
+            input.into_raw_vec(),
+            dims,
+        )
+        .map_err(|e| format!("Failed to create input tensor: {}", e))?;
+
+        let inputs = [onnxruntime::NamedOnnxValue::from_tensor(input_tensor)];
+        let outputs = session
+            .run(&inputs)
+            .map_err(|e| format!("ONNX inference failed: {}", e))?;
+
+        let mut result = Vec::new();
+        for output in outputs.iter() {
+            if let Ok(tensor) = output.try_extract_tensor::<f32>() {
+                result.extend(tensor.iter().cloned());
+            }
+        }
+        Ok(result)
+    }
+
+    #[cfg(not(all(target_os = "windows", feature = "onnx")))]
+    pub fn run(&self, _input: Array<f32, Ix4>) -> Result<Vec<f32>, String> {
+        Err("ONNX Runtime is only available on Windows with the `onnx` feature.".into())
     }
 
     fn finalize_session(&mut self, image_size: usize) {
@@ -225,6 +420,38 @@ fn calculate_num_detections(image_size: usize) -> usize {
     let s16 = image_size / 16;
     let s32 = image_size / 32;
     s8 * s8 + s16 * s16 + s32 * s32
+}
+
+/// Detect the YOLO output tensor layout from its shape.
+#[cfg(all(target_os = "windows", feature = "onnx"))]
+fn detect_output_format(dims: &[usize]) -> ModelOutputFormat {
+    if dims.len() == 3 {
+        if dims[2] == 6 {
+            ModelOutputFormat::YoloEndToEndBoxesFirst
+        } else if dims[1] == 6 && dims[2] > 6 {
+            ModelOutputFormat::YoloEndToEndChannelsFirst
+        } else if dims[1] < dims[2] {
+            ModelOutputFormat::YoloRawChannelsFirst
+        } else {
+            ModelOutputFormat::YoloRawChannelsLast
+        }
+    } else {
+        ModelOutputFormat::YoloRawChannelsFirst
+    }
+}
+
+#[cfg(not(all(target_os = "windows", feature = "onnx")))]
+fn detect_output_format(_dims: &[usize]) -> ModelOutputFormat {
+    ModelOutputFormat::YoloRawChannelsFirst
+}
+
+/// Infer the number of classes from output shape and format.
+fn infer_num_classes(dims: &[usize], format: ModelOutputFormat) -> usize {
+    match format {
+        ModelOutputFormat::YoloRawChannelsFirst => dims[2].saturating_sub(4),
+        ModelOutputFormat::YoloRawChannelsLast => dims[1].saturating_sub(4),
+        _ => 1,
+    }
 }
 
 /// Sticky-aim state machine (port of Aimmy's `HandleStickyAim`).
@@ -594,6 +821,12 @@ pub fn fov_bounds(image_size: f32, fov_size: f32) -> (f32, f32, f32, f32) {
 
 /// Build a 3D float tensor [1, 3, size, size] from BGRA8 pixels for ONNX.
 pub fn build_input_tensor(pixels: &[u8], size: usize) -> Array<f32, Ix3> {
+    let planar = bgra8_to_float_planar(pixels, size);
+    Array::from_shape_vec((1, 3, size, size), planar).unwrap()
+}
+
+/// Build a 4D float tensor [1, 3, size, size] for the ONNX session `run()`.
+pub fn build_input_tensor_4d(pixels: &[u8], size: usize) -> Array<f32, Ix4> {
     let planar = bgra8_to_float_planar(pixels, size);
     Array::from_shape_vec((1, 3, size, size), planar).unwrap()
 }

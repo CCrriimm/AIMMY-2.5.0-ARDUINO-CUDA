@@ -1,0 +1,90 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ "arena/bad9bbbe-aimmy-2-5-0-arduino-cuda", "aimmy-rust-rewrite" ]
+  pull_request:
+    branches: [ "arena/bad9bbbe-aimmy-2-5-0-arduino-cuda", "aimmy-rust-rewrite" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-windows:
+    # Windows build with ONNX Runtime (CPU provider). CUDA/DirectML/TensorRT
+    # require additional SDKs not present on GitHub-hosted runners, so those
+    # are verified locally with --features aimmy-inference/onnx-cuda etc.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Rust workspace (CPU provider)
+        working-directory: aimmy-rust
+        run: cargo build --release --features aimmy-inference/onnx
+
+      - name: Check all targets compile
+        working-directory: aimmy-rust
+        run: cargo check --all-targets --features aimmy-inference/onnx
+
+  build-linux:
+    # Non-Windows build: verifies that the #[cfg(not(windows))] stubs compile
+    # and the workspace is coherent. ONNX inference is disabled here.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Rust workspace (no ONNX)
+        working-directory: aimmy-rust
+        run: cargo build --release
+
+      - name: Check all targets compile
+        working-directory: aimmy-rust
+        run: cargo check --all-targets
+
+  clippy-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run clippy
+        working-directory: aimmy-rust
+        run: cargo clippy --all-targets --features aimmy-inference/onnx -- -D warnings

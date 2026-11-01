@@ -4,7 +4,7 @@ use aimmy_core::config::AppConfig;
 use aimmy_core::logging::{LogManager, LogLevel};
 use aimmy_core::types::{Prediction as CorePrediction, RectangleF};
 use aimmy_inference::{
-    calculate_coordinates, detection_box, fov_bounds, parse_output, build_input_tensor,
+    calculate_coordinates, detection_box, fov_bounds, parse_output, build_input_tensor_4d,
     sticky_aim::StickyAim, ExecutionProvider, ModelFormat, OnnxSession,
 };
 use aimmy_inference::model::{auto_trigger, TriggerAction};
@@ -174,9 +174,16 @@ impl AimmyApp {
             return;
         };
 
-        // Preprocess + run inference (stubbed when onnx feature off).
-        let _input = build_input_tensor(&frame.pixels, image_size as usize);
-        let detections = self.run_inference(image_size as usize);
+        // Preprocess + run inference (real ONNX when `onnx` feature is on).
+        let input = build_input_tensor_4d(&frame.pixels, image_size as usize);
+        let detections = match self.session.run(input) {
+            Ok(d) => d,
+            Err(e) => {
+                LogManager::warn(&format!("Inference error: {e}"));
+                self.mouse.reset_movement();
+                return;
+            }
+        };
 
         let fov_size = self.config.slider_settings.get("FOV Size") as f32;
         let (fov_min_x, fov_max_x, fov_min_y, fov_max_y) = fov_bounds(image_size as f32, fov_size);
@@ -316,7 +323,7 @@ impl AimmyApp {
     }
 
     fn run_inference(&mut self, _size: usize) -> Vec<f32> {
-        // Real ONNX execution goes here behind the `onnx` feature flag.
+        // Real ONNX execution is handled inline via self.session.run() above.
         vec![]
     }
 

@@ -10,6 +10,9 @@ ndarray-linalg = "0.15"
 serde = { version = "1", features = ["derive"] }
 
 # ONNX Runtime bindings (Windows). Enabled behind the `onnx` feature.
+# Execution-provider features (cuda / directml / tensorrt) are additive on
+# top of the default CPU provider. Build with e.g.:
+#   cargo build --release --features aimmy-inference/onnx,aimmy-inference/onnx-cuda
 [target.'cfg(target_os = "windows")'.dependencies.onnxruntime]
 version = "0.17"
 optional = true
@@ -17,3 +20,6 @@ optional = true
 [features]
 default = []
 onnx = ["dep:onnxruntime"]
+onnx-cuda = ["dep:onnxruntime/cuda"]
+onnx-directml = ["dep:onnxruntime/directml"]
+onnx-tensorrt = ["dep:onnxruntime/tensorrt"]
