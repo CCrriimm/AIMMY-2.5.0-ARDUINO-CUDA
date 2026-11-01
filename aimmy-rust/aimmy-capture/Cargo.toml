@@ -1,0 +1,18 @@
+[package]
+name = "aimmy-capture"
+description = "Screen capture for Aimmy Rust (DXGI Desktop Duplication + GDI fallback)"
+
+[dependencies]
+aimmy-core = { path = "../aimmy-core" }
+log = "0.4"
+
+# Windows-only APIs for monitor enumeration, DXGI duplication and GDI capture.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_System_SystemServices",
+    "Win32_UI_WindowsAndMessaging",
+] }

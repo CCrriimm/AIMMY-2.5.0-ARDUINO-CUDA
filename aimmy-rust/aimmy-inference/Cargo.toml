@@ -1,0 +1,19 @@
+[package]
+name = "aimmy-inference"
+description = "ONNX YOLO inference engine for Aimmy Rust (CUDA / DirectML / TensorRT / CPU)"
+
+[dependencies]
+aimmy-core = { path = "../aimmy-core" }
+aimmy-capture = { path = "../aimmy-capture" }
+ndarray = "0.15"
+ndarray-linalg = "0.15"
+serde = { version = "1", features = ["derive"] }
+
+# ONNX Runtime bindings (Windows). Enabled behind the `onnx` feature.
+[target.'cfg(target_os = "windows")'.dependencies.onnxruntime]
+version = "0.17"
+optional = true
+
+[features]
+default = []
+onnx = ["dep:onnxruntime"]

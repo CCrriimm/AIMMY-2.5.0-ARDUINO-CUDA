@@ -1,0 +1,21 @@
+[package]
+name = "aimmy"
+description = "Aimmy 2.5.0 Rust rewrite — AI-based aim alignment mechanism"
+
+[dependencies]
+aimmy-core = { path = "../aimmy-core" }
+aimmy-capture = { path = "../aimmy-capture" }
+aimmy-inference = { path = "../aimmy-inference" }
+aimmy-input = { path = "../aimmy-input" }
+aimmy-bindings = { path = "../aimmy-bindings" }
+aimmy-ui = { path = "../aimmy-ui" }
+
+eframe = "0.27"
+egui = "0.27"
+log = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

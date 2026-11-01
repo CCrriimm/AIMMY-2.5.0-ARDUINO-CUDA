@@ -1,0 +1,20 @@
+[package]
+name = "aimmy-input"
+description = "Mouse movement and input backends for Aimmy Rust (Arduino / Makcu / ViGEm / Windows)"
+
+[dependencies]
+aimmy-core = { path = "../aimmy-core" }
+rand = "0.8"
+fastrand = "0.2"
+
+# Cross-platform serial for Arduino/Makcu.
+serialport = "5"
+
+# Windows-only: raw input injection and ViGEm virtual gamepad.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemServices",
+    "Win32_UI_Input",
+    "Win32_UI_WindowsAndMessaging",
+] }

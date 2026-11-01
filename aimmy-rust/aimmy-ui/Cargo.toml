@@ -1,0 +1,21 @@
+[package]
+name = "aimmy-ui"
+description = "egui/eframe user interface for Aimmy Rust"
+
+[dependencies]
+aimmy-core = { path = "../aimmy-core" }
+aimmy-capture = { path = "../aimmy-capture" }
+aimmy-inference = { path = "../aimmy-inference" }
+aimmy-input = { path = "../aimmy-input" }
+aimmy-bindings = { path = "../aimmy-bindings" }
+
+egui = "0.27"
+eframe = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
